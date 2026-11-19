@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Calculadora</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; touch-action: none;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  canvas { display: block; position: fixed; left: 0; top: 0; }
+  @font-face { font-family: 'Seg'; src: url('fonts/DSEG7Classic-Bold.woff2') format('woff2'); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script src="layout.js"></script>
+<script src="engine.js"></script>
+<script>
+(function () {
+  'use strict';
+  var E = window.CalcEngine, T = E.T;
+  var A = window.Android || null; // puente nativo (solo en la app)
+
+  // ===================== DISTRIBUCIÓN FÍSICA (layout.js, generado por gen_layout.py) =====================
+  var L = window.LAYOUT, KEYS = L.keys, LCD = L.lcd, SCREEN_W = L.screenW, SCREEN_H = L.screenH;
+  var K_SHIFT = KEYS.findIndex(function (k) { return k.a === 'shift'; });
+  var K_EQ = KEYS.findIndex(function (k) { return k.a === 'eq'; });
+  var FUNC_ROW_TOP = Math.min.apply(null, KEYS.map(function (k) { return k.y - k.h / 2; }));
+
+  // ===================== ESTADO =====================
+  var st = {
+    tokens: [], cur: 0, result: '', shown: false, err: '', ans: 0, deg: true, shift: false,
+    off: false, ins: false, hyp: false, mem: 0, hist: [], hi: -1, frac: false, locked: false, cal: 0, calP1: null, msg: '', msgUntil: 0
+  };
+  var onTimes = [];
+
+  function load(k, d) { try { var v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } }
+  function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+  st.deg = load('deg', true);
+  st.ans = load('ans', 0);
+  st.mem = load('mem', 0);
+  st.hist = load('hist', []);
+  var calib = load('calib', null); // {sx, sy, ox, oy} en px CSS
+
+  // ===================== MAPEO mm <-> px =====================
+  var cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  var W = 0, H = 0, M = null;
+  function defaultMap() {
+    var s = W / SCREEN_W, ox = 0, oy = 0;
+    if (W / H > 0.6) { s = Math.min(W / SCREEN_W, H / SCREEN_H); ox = (W - SCREEN_W * s) / 2; oy = (H - SCREEN_H * s) / 2; }
+    return { sx: s, sy: s, ox: ox, oy: oy };
+  }
+  function resize() {
+    var dpr = window.devicePixelRatio || 1;
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    cv.style.width = W + 'px'; cv.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    M = calib || defaultMap();
+    draw();
+  }
+  function X(mm) { return M.ox + mm * M.sx; }
+  function Y(mm) { return M.oy + mm * M.sy; }
+
+  function hit(px, py) {
+    var mx = (px - M.ox) / M.sx, my = (py - M.oy) / M.sy, best = -1, bd = 1e9;
+    for (var i = 0; i < KEYS.length; i++) {
+      var k = KEYS[i], dx = Math.abs(mx - k.x) - k.w / 2, dy = Math.abs(my - k.y) - k.h / 2;
+      var d = Math.max(dx, dy);
+      if (d < 2.2 && d < bd) { bd = d; best = i; } // 2.2 mm de tolerancia
+    }
+    return best < 0 ? null : best;
+  }
+
+  // ===================== LÓGICA DE TECLAS =====================
+  var HYP = { sin: 'sinh', cos: 'cosh', tan: 'tanh', asin: 'asinh', acos: 'acosh', atan: 'atanh' };
+  function insert(id) {
+    if (st.hyp && HYP[id]) id = HYP[id];
+    st.hyp = false;
+    st.hi = -1; st.frac = false;
+    if (st.shown) {
+      // después de "=": un número empieza de cero, un operador sigue con Ans
+      var t = T[id];
+      st.tokens = (t.k === 'op' || t.k === 'pf') ? [T.ans] : [];
+      st.cur = st.tokens.length; st.shown = false; st.result = '';
+    }
+    st.err = '';
+    if (st.ins || st.cur >= st.tokens.length) st.tokens.splice(st.cur, 0, T[id]);
+    else st.tokens.splice(st.cur, 1, T[id]);
+    st.cur++;
+  }
+
+  function calc() {
+    if (!st.tokens.length) return;
+    try {
+      var v = E.evaluate(st.tokens, { deg: st.deg, ans: st.ans, mem: st.mem });
+      if (v === null) return;
+      v = parseFloat(v.toPrecision(12));
+      st.ans = v; save('ans', v);
+      st.result = E.format(v); st.err = ''; st.frac = false;
+      st.hist.push(st.tokens.map(function (t) { return keyOf(t); })); if (st.hist.length > 20) st.hist.shift();
+      save('hist', st.hist); st.hi = -1;
+    } catch (e) { st.err = e.message || 'Syntax ERROR'; st.result = ''; }
+    st.shown = true; st.cur = st.tokens.length;
+  }
+
+  function keyOf(t) { for (var n in T) if (T[n] === t) return n; return '0'; }
+  function recall(dir) {
+    if (!st.hist.length) return;
+    st.hi = st.hi < 0 ? st.hist.length - 1 : Math.max(0, Math.min(st.hist.length - 1, st.hi + dir));
+    st.tokens = st.hist[st.hi].map(function (n) { return T[n]; });
+    st.cur = st.tokens.length; st.shown = false; st.result = ''; st.err = '';
+    calc();
+  }
+  function toFrac(x) {
+    if (Math.abs(x - Math.round(x)) < 1e-12) return null;
+    var h1 = 1, h0 = 0, k1 = 0, k0 = 1, b = x;
+    for (var i = 0; i < 30; i++) {
+      var a = Math.floor(b), h2 = a * h1 + h0, k2 = a * k1 + k0;
+      h0 = h1; h1 = h2; k0 = k1; k1 = k2;
+      if (Math.abs(x - h1 / k1) < 1e-10 || k1 > 99999) break;
+      b = 1 / (b - a);
+    }
+    if (k1 > 99999 || Math.abs(x - h1 / k1) > 1e-10) return null;
+    return (h1 < 0 ? '\u2212' : '') + Math.abs(h1) + '\u2044' + k1;
+  }
+  function memAdd(sign) {
+    if (st.tokens.length && !st.shown) calc();
+    if (st.err) return;
+    st.mem = parseFloat((st.mem + sign * st.ans).toPrecision(12)); save('mem', st.mem);
+  }
+
+  function flash(m, ms) { st.msg = m; st.msgUntil = Date.now() + (ms || 1500); setTimeout(draw, (ms || 1500) + 20); }
+
+  function onKey() {
+    var now = Date.now();
+    onTimes = onTimes.filter(function (t) { return now - t < 3000; });
+    onTimes.push(now);
+    if (onTimes.length >= 5) {
+      onTimes = [];
+      toggleLock();
+      return;
+    }
+    st.off = false;
+    st.tokens = []; st.cur = 0; st.result = ''; st.err = ''; st.shown = false; st.shift = false;
+  }
+
+  function isLocked() { try { return A ? !!A.isLocked() : st.locked; } catch (e) { return st.locked; } }
+  function toggleLock() {
+    if (!isLocked()) {
+      if (A) A.lock();
+      st.locked = true; flash('MODO CALC', 1500);
+    } else {
+      st.locked = false; flash('CELULAR', 800);
+      if (A) A.unlock();
+    }
+  }
+
+  function press(i) {
+    var k = KEYS[i];
+    var id = (st.shift && k.sa) ? k.sa : k.a;
+    var wasShift = st.shift;
+    st.shift = false;
+    if (A && A.vibrate) { try { A.vibrate(12); } catch (e) {} }
+
+    if (st.cal) { return; }
+    if (id === 'on') { onKey(); draw(); return; }
+    if (st.off) { draw(); return; } // apagada: solo responde ON
+    onTimes = [];
+
+    switch (id) {
+      case 'shift': st.shift = !wasShift; break;
+      case 'hyp': st.hyp = !st.hyp; break;
+      case 'mode': st.deg = !st.deg; save('deg', st.deg); flash(st.deg ? 'DEG' : 'RAD', 900); break;
+      case 'setup': startCal(); break;
+      case 'left': if (st.shown) { st.shown = false; st.cur = st.tokens.length; } else if (st.cur > 0) st.cur--; break;
+      case 'right': if (st.shown) { st.shown = false; st.cur = 0; } else if (st.cur < st.tokens.length) st.cur++; break;
+      case 'up': recall(-1); break;
+      case 'down': recall(1); break;
+      case 'del':
+        if (st.shown) { st.shown = false; st.result = ''; st.err = ''; st.cur = st.tokens.length; }
+        if (st.cur > 0) { st.tokens.splice(st.cur - 1, 1); st.cur--; }
+        else if (st.tokens.length) st.tokens.splice(0, 1);
+        break;
+      case 'ins': st.ins = !st.ins; break;
+      case 'ac': st.tokens = []; st.cur = 0; st.result = ''; st.err = ''; st.shown = false; st.hyp = false; st.hi = -1; break;
+      case 'off': st.off = true; st.tokens = []; st.cur = 0; st.result = ''; st.shown = false; break;
+      case 'eq': calc(); break;
+      case 'mplus': memAdd(1); flash('M+', 600); break;
+      case 'mminus': memAdd(-1); flash('M\u2212', 600); break;
+      case 'mclr': st.mem = 0; save('mem', 0); flash('M = 0', 800); break;
+      case 'sd':
+        if (st.shown && !st.err) { var f = toFrac(st.ans); if (f) { st.frac = !st.frac; st.result = st.frac ? f : E.format(st.ans); } }
+        break;
+      default: if (T[id]) insert(id);
+    }
+    draw();
+  }
+
+  // ===================== CALIBRACIÓN =====================
+  function startCal() { st.cal = 1; st.calP1 = null; draw(); }
+  function calTouch(px, py) {
+    if (st.cal === 1) { st.calP1 = { x: px, y: py }; st.cal = 2; draw(); return; }
+    var a = KEYS[K_SHIFT], b = KEYS[K_EQ], p1 = st.calP1;
+    var sx = (px - p1.x) / (b.x - a.x), sy = (py - p1.y) / (b.y - a.y);
+    var d = defaultMap();
+    if (!(sx > d.sx * 0.6 && sx < d.sx * 1.6 && sy > d.sy * 0.6 && sy < d.sy * 1.6)) {
+      st.cal = 1; st.calP1 = null; flash('ERROR: REPETIR', 1500); draw(); return;
+    }
+    calib = { sx: sx, sy: sy, ox: p1.x - a.x * sx, oy: p1.y - a.y * sy };
+    save('calib', calib); M = calib; st.cal = 0; flash('CALIBRADO', 1500); draw();
+  }
+
+  // ===================== DIBUJO =====================
+  function rr(x, y, w, h, r) {
+    ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+
+  function exprText() {
+    var s = '', curPos = 0;
+    for (var i = 0; i < st.tokens.length; i++) { if (i === st.cur) curPos = s.length; s += st.tokens[i].s; }
+    if (st.cur >= st.tokens.length) curPos = s.length;
+    return { s: s, cur: curPos };
+  }
+
+  function draw() {
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+    if (!A) { ctx.fillStyle = '#26292d'; rr(X(-3.4), Y(-3.8), (SCREEN_W + 6.9) * M.sx, (SCREEN_H + 9.1) * M.sy, 8 * M.sx); ctx.fill(); }
+
+    if (st.cal) {
+      // Instrucciones grandes en toda la parte superior (se ven aunque la calibración esté mal)
+      ctx.fillStyle = '#c9d1c0'; ctx.fillRect(0, 0, W, Math.max(Y(FUNC_ROW_TOP) - 4, H * 0.2));
+      ctx.fillStyle = '#111'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.font = 'bold ' + Math.round(W * 0.06) + 'px sans-serif';
+      var y0 = Math.max(Y(FUNC_ROW_TOP) - 4, H * 0.2);
+      ctx.fillText('CALIBRAR', W / 2, y0 * 0.35);
+      ctx.fillText(st.cal === 1 ? 'PRESIONA  SHIFT' : 'PRESIONA  =', W / 2, y0 * 0.68);
+      drawKeys(true);
+      return;
+    }
+
+    drawKeys(false);
+
+    drawLCD();
+  }
+
+  // ---------- LCD: matriz de puntos (línea de entrada) + 7 segmentos (resultado) ----------
+  var LCD_BG = '#c3cab6', LCD_INK = '#1d2119', LCD_GHOST = 'rgba(29,33,25,0.06)', DOT_GHOST = 'rgba(29,33,25,0.035)';
+  var dotCv = document.createElement('canvas'), dctx = dotCv.getContext('2d', { willReadFrequently: true });
+
+  // Dibuja texto como matriz de puntos: se rasteriza chico y cada píxel encendido es un punto
+  function dotText(txt, x, y, maxW, rows, pitch, align, cursorAt) {
+    dctx.font = 'bold ' + (rows + 1) + 'px monospace';
+    var tw = Math.ceil(dctx.measureText(txt).width) + 2;
+    var cols = Math.max(1, Math.floor(maxW / pitch));
+    dotCv.width = Math.max(tw, cols); dotCv.height = rows + 2;
+    dctx.font = 'bold ' + (rows + 1) + 'px monospace';
+    dctx.fillStyle = '#000'; dctx.textBaseline = 'top';
+    dctx.fillText(txt, 1, 0);
+    var shift = 0;
+    if (cursorAt !== undefined) {
+      var cx = 1 + dctx.measureText(txt.slice(0, cursorAt)).width;
+      shift = Math.max(0, Math.ceil(cx - cols + 3));
+      if (Math.floor(Date.now() / 500) % 2 === 0) dctx.fillRect(Math.round(cx), 0, 1, rows + 1);
+    }
+    var img = dctx.getImageData(0, 0, dotCv.width, dotCv.height).data;
+    var x0 = align === 'right' ? x + maxW - Math.min(tw, cols) * pitch : x;
+    var d = pitch * 0.82;
+    for (var j = 0; j < rows + 2; j++) for (var i = 0; i < cols; i++) {
+      var si = i + shift; if (si >= dotCv.width) break;
+      var on = img[(j * dotCv.width + si) * 4 + 3] > 110;
+      ctx.fillStyle = on ? LCD_INK : DOT_GHOST;
+      ctx.fillRect(x0 + i * pitch, y + j * pitch, d, d);
+    }
+  }
+
+  var SUPD = { '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4', '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9', '⁻': '-' };
+  function segText(txt, right, base, size) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'alphabetic';
+    ctx.font = size + 'px Seg';
+    ctx.fillStyle = LCD_GHOST; ctx.fillText('8888888888', right, base);
+    ctx.fillStyle = LCD_INK; ctx.fillText(txt.replace(/−/g, '-'), right, base);
+  }
+
+  function drawLCD() {
+    var m = 2, lx = X(LCD.x - m), ly = Y(LCD.y - m), lw = (LCD.w + 2 * m) * M.sx, lh = (LCD.h + 2 * m) * M.sy;
+    if (st.off) { ctx.fillStyle = '#b4baa8'; ctx.fillRect(lx, ly, lw, lh); return; }
+    var g = ctx.createLinearGradient(0, ly, 0, ly + lh);
+    g.addColorStop(0, '#b7bea9'); g.addColorStop(0.12, LCD_BG); g.addColorStop(1, '#c9d0bd');
+    ctx.fillStyle = g; ctx.fillRect(lx, ly, lw, lh);
+
+    var pad = (m + 1.6) * M.sx, ix = lx + pad, iw = lw - 2 * pad, top = ly + (m + 0.9) * M.sy;
+    var pitch = 0.36 * M.sx;
+
+    // indicadores (fila superior, puntos pequeños)
+    var inds = [];
+    if (st.shift) inds.push('S');
+    if (st.hyp) inds.push('hyp');
+    if (st.mem !== 0) inds.push('M');
+    inds.push(st.deg ? 'D' : 'R');
+    if (st.ins) inds.push('INS');
+    if (isLocked()) inds.push('■');
+    dotText(inds.join('  '), ix, top, iw, 6, pitch * 0.8);
+
+    var now = Date.now(), y1 = top + 8.5 * pitch * 0.8 + 0.6 * M.sy;
+    if (st.msg && now < st.msgUntil) {
+      dotText(st.msg, ix, y1 + 3 * pitch, iw, 14, pitch);
+      return;
+    }
+
+    // línea de entrada en matriz de puntos
+    var et = exprText();
+    dotText(et.s, ix, y1, iw, 11, pitch, 'left', st.shown ? undefined : et.cur);
+
+    // resultado
+    var out = st.err || (st.shown ? st.result : '');
+    var base = ly + lh - (m + 1.1) * M.sy;
+    if (!out) return;
+    if (st.err || /⁄/.test(out)) {
+      dotText(out, ix, base - 14 * pitch, iw, 13, pitch, 'right');
+      return;
+    }
+    var mexp = out.match(/^(.*)×10(.+)$/);
+    var size = Math.round(7.2 * M.sy);
+    ctx.font = size + 'px Seg';
+    while (ctx.measureText('8888888888').width > iw && size > 8) { size--; ctx.font = size + 'px Seg'; }
+    if (mexp) {
+      var ex = mexp[2].split('').map(function (c) { return SUPD[c] || c; }).join('');
+      var es = Math.round(size * 0.5);
+      ctx.font = es + 'px Seg';
+      var ew = ctx.measureText('-88').width;
+      var xw = 3 * 6 * pitch;               // ancho de "×10" en puntos
+      var right = ix + iw - ew - xw - 1.0 * M.sx;
+      ctx.font = Math.round(size * 0.78) + 'px Seg';
+      ctx.textAlign = 'right'; ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = LCD_GHOST; ctx.fillText('88888888', right, base);
+      ctx.fillStyle = LCD_INK; ctx.fillText(mexp[1].replace(/−/g, '-'), right, base);
+      dotText('×10', right + 0.5 * M.sx, base - 11 * pitch, xw + 2 * pitch, 10, pitch);
+      ctx.font = es + 'px Seg'; ctx.textAlign = 'right'; ctx.fillStyle = LCD_GHOST; ctx.fillText('88', ix + iw, base - size * 0.42);
+      ctx.fillStyle = LCD_INK; ctx.fillText(ex, ix + iw, base - size * 0.42);
+    } else {
+      segText(out, ix + iw, base, size);
+    }
+  }
+
+  // Teclas dibujadas tenues: bajo la funda no se ven; sin funda sirven para usarla igual
+  var SHADE = { c: '#5a5f66', p: '#5a5f66', f: '#1f2226', d: '#e8e8e3', n: '#3a3e44', a: '#c8642d' };
+  var INK = { c: '#f2f2f2', p: '#f2f2f2', f: '#f2f2f2', d: '#16181b', n: '#f2f2f2', a: '#ffffff' };
+  function drawKeys(cal) {
+    for (var i = 0; i < KEYS.length; i++) {
+      var k = KEYS[i];
+      var w = k.w * M.sx, h = k.h * M.sy, x = X(k.x) - w / 2, y = Y(k.y) - h / 2;
+      var hl = cal && ((st.cal === 1 && i === K_SHIFT) || (st.cal === 2 && i === K_EQ));
+      ctx.fillStyle = hl ? '#ddd' : SHADE[k.g]; rr(x, y, w, h, 1.3 * M.sx); ctx.fill();
+      ctx.fillStyle = hl ? '#000' : INK[k.g]; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      var fk = Math.round((k.g === 'd' ? 4.2 : 3.0) * M.sy);
+      ctx.font = fk + 'px sans-serif';
+      while (ctx.measureText(k.l).width > w * 0.85 && fk > 6) { fk--; ctx.font = fk + 'px sans-serif'; }
+      ctx.fillText(k.l, X(k.x), Y(k.y));
+      if (k.sl && !cal) {
+        ctx.fillStyle = '#8a8a8a'; ctx.font = Math.round(1.9 * M.sy) + 'px sans-serif';
+        ctx.fillText(k.sl, X(k.x), y - 1.1 * M.sy);
+      }
+    }
+  }
+
+  // ===================== ENTRADA TÁCTIL =====================
+  var lastKey = null, lastT = 0;
+  cv.addEventListener('pointerdown', function (ev) {
+    ev.preventDefault();
+    if (st.cal) { calTouch(ev.clientX, ev.clientY); return; }
+    var h = hit(ev.clientX, ev.clientY);
+    if (h === null) return;
+    var now = Date.now();
+    if (h === lastKey && now - lastT < 70) return; // rebote
+    lastKey = h; lastT = now;
+    press(h);
+  }, { passive: false });
+  document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+  // Teclado de PC para probar en navegador
+  var KB = { 'Enter': 'eq', '=': 'eq', 'Backspace': 'del', 'Escape': 'ac', '+': '+', '-': '-', '*': '*', '/': '/', '.': '.',
+    '(': '(', ')': ')', 'ArrowLeft': 'left', 'ArrowRight': 'right', 'ArrowUp': 'up', 'ArrowDown': 'down', 'o': 'on', 's': 'shift', '^': '^' };
+  window.addEventListener('keydown', function (e) {
+    var a = /^[0-9]$/.test(e.key) ? e.key : KB[e.key];
+    if (!a) return;
+    var i = KEYS.findIndex(function (k) { return k.a === a; });
+    if (i >= 0) { e.preventDefault(); press(i); }
+  });
+
+  // Estado de fijación cuando la app vuelve al frente
+  window.onAppResume = function () { st.locked = isLocked(); draw(); };
+
+  window.addEventListener('resize', resize);
+  setInterval(draw, 500); // parpadeo del cursor
+  resize();
+  if (document.fonts && document.fonts.load) document.fonts.load('20px Seg').then(draw, draw);
+  if (!calib && A) startCal(); // primera vez en el celular: calibrar
+})();
+</script>
+</body>
+</html>
